@@ -4,7 +4,8 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi.responses import Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -15,9 +16,20 @@ from app.models import CollegeDomain, EmailVerificationToken, User
 from app.schemas.auth import AuthResponse, LoginRequest, ProfileUpdateRequest, RegisterRequest, UserResponse, VerifyEmailRequest
 from app.services.security import create_access_token, hash_password, verify_password
 from app.services.email_service import send_verification_email
+from app.services.malware_scanner import scan_bytes
+from app.services.storage import delete as delete_stored_file
+from app.services.storage import read as read_stored_file
+from app.services.storage import store as store_file
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 bearer_scheme = HTTPBearer()
+PROFILE_MAX_SIZE = 5 * 1024 * 1024
+PROFILE_TYPES = {
+    ".jpg": ("image/jpeg", lambda value: value.startswith(b"\xff\xd8\xff")),
+    ".jpeg": ("image/jpeg", lambda value: value.startswith(b"\xff\xd8\xff")),
+    ".png": ("image/png", lambda value: value.startswith(b"\x89PNG\r\n\x1a\n")),
+    ".webp": ("image/webp", lambda value: len(value) >= 12 and value[:4] == b"RIFF" and value[8:12] == b"WEBP"),
+}
 
 
 def normalized_email(value: str) -> str:
@@ -94,6 +106,66 @@ def me(credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme), db: S
     if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="Invalid authentication token.")
     return user
+
+
+def authenticated_user(credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme), db: Session = Depends(get_db)) -> User:
+    return me(credentials, db)
+
+
+@router.post("/me/profile-picture", response_model=UserResponse)
+async def upload_profile_picture(file: UploadFile = File(...), user: User = Depends(authenticated_user), db: Session = Depends(get_db)) -> User:
+    from pathlib import Path
+
+    extension = Path(file.filename or "").suffix.lower()
+    profile_type = PROFILE_TYPES.get(extension)
+    if not profile_type:
+        raise HTTPException(status_code=415, detail="Profile pictures must be JPG, PNG, or WebP files.")
+    content = await file.read(PROFILE_MAX_SIZE + 1)
+    if not content or len(content) > PROFILE_MAX_SIZE:
+        raise HTTPException(status_code=413, detail="Profile pictures must be between 1 byte and 5 MB.")
+    content_type, signature_check = profile_type
+    if not signature_check(content):
+        raise HTTPException(status_code=415, detail="The image content does not match its extension.")
+    scan_bytes(content)
+    storage_key = f"profile-pictures/{user.id}{extension}"
+    new_path = store_file(storage_key, content, content_type)
+    old_path = user.profile_picture_storage_path
+    user.profile_picture_storage_path = new_path
+    try:
+        db.commit()
+        db.refresh(user)
+    except Exception as error:
+        db.rollback()
+        try:
+            delete_stored_file(new_path)
+        except Exception:
+            pass
+        raise HTTPException(status_code=503, detail="The profile picture could not be saved.") from error
+    if old_path and old_path != new_path:
+        try:
+            delete_stored_file(old_path)
+        except Exception:
+            pass
+    return user
+
+
+@router.get("/me/profile-picture")
+def get_profile_picture(user: User = Depends(authenticated_user)) -> Response:
+    if not user.profile_picture_storage_path:
+        raise HTTPException(status_code=404, detail="No profile picture has been uploaded.")
+    content = read_stored_file(user.profile_picture_storage_path)
+    media_type = "image/png" if user.profile_picture_storage_path.endswith(".png") else "image/webp" if user.profile_picture_storage_path.endswith(".webp") else "image/jpeg"
+    return Response(content=content, media_type=media_type, headers={"Cache-Control": "private, max-age=300"})
+
+
+@router.delete("/me/profile-picture", status_code=status.HTTP_204_NO_CONTENT)
+def remove_profile_picture(user: User = Depends(authenticated_user), db: Session = Depends(get_db)) -> None:
+    old_path = user.profile_picture_storage_path
+    if not old_path:
+        return
+    delete_stored_file(old_path)
+    user.profile_picture_storage_path = None
+    db.commit()
 
 
 @router.patch("/me", response_model=UserResponse)

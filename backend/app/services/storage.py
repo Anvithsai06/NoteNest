@@ -27,8 +27,9 @@ def _drive_service():
 def store(key: str, content: bytes, content_type: str) -> str:
     _require_allowed_backend()
     if settings.storage_backend == "local":
-        settings.upload_directory.mkdir(parents=True, exist_ok=True)
-        (settings.upload_directory / key).write_bytes(content)
+        path = settings.upload_directory / key
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
         return key
     if settings.storage_backend != "google_drive":
         raise HTTPException(status_code=500, detail="Unknown storage backend.")

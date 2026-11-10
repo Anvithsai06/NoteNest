@@ -26,6 +26,7 @@ class UserResponse(BaseModel):
     college_name: str
     is_email_verified: bool
     is_admin: bool
+    has_profile_picture: bool
     model_config = {"from_attributes": True}
 
 
