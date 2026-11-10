@@ -1,0 +1,16 @@
+services:
+  clamav:
+    image: clamav/clamav:stable
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3310:3310"
+    volumes:
+      - clamav_database:/var/lib/clamav
+    healthcheck:
+      test: ["CMD-SHELL", "clamdscan --version"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+volumes:
+  clamav_database:
